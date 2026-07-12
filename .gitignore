@@ -29,6 +29,10 @@ backend/.pytest_cache/
 backend/uploads/
 backend/credentials/
 backend/models/*.pkl
+backend/models/
+backend/*.pkl
+backend/*.pk1
+backend/*.pickle
 
 # Python cache
 *.pyc
