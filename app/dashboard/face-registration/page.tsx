@@ -1,7 +1,7 @@
 'use client'
 
 import { Camera, CheckCircle2, RefreshCw, ScanFace, UserPlus } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 import { PageHeader } from '@/components/dashboard/page-header'
 import { Button } from '@/components/ui/button'
@@ -11,7 +11,7 @@ import { Label } from '@/components/ui/label'
 import { Select } from '@/components/ui/select'
 import { cn } from '@/lib/utils'
 
-type Stage = 'idle' | 'detected' | 'captured' | 'registered'
+type Stage = 'idle' | 'camera' | 'captured' | 'registered'
 
 interface Student {
   student_id?: string
@@ -28,12 +28,12 @@ const fallbackYears = ['1st Year', '2nd Year', '3rd Year', '4th Year']
 
 const statusCopy: Record<Stage, { label: string; tone: string }> = {
   idle: {
-    label: 'Camera ready — position the face inside the frame',
+    label: 'Start camera and position face inside the frame',
     tone: 'text-muted-foreground',
   },
-  detected: {
-    label: 'Face detected — ready to capture',
-    tone: 'text-warning',
+  camera: {
+    label: 'Camera active — ready to capture',
+    tone: 'text-primary',
   },
   captured: {
     label: 'Face captured — ready to register',
@@ -46,12 +46,20 @@ const statusCopy: Record<Stage, { label: string; tone: string }> = {
 }
 
 export default function FaceRegistrationPage() {
+  const videoRef = useRef<HTMLVideoElement | null>(null)
+  const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const streamRef = useRef<MediaStream | null>(null)
+
   const [stage, setStage] = useState<Stage>('idle')
   const [students, setStudents] = useState<Student[]>([])
   const [studentId, setStudentId] = useState('STU-013')
   const [studentName, setStudentName] = useState('')
   const [department, setDepartment] = useState('')
   const [year, setYear] = useState('')
+  const [capturedBlob, setCapturedBlob] = useState<Blob | null>(null)
+  const [capturedImage, setCapturedImage] = useState<string | null>(null)
+  const [message, setMessage] = useState('')
+  const [isLoading, setIsLoading] = useState(false)
 
   useEffect(() => {
     async function loadStudents() {
@@ -72,6 +80,10 @@ export default function FaceRegistrationPage() {
     }
 
     loadStudents()
+
+    return () => {
+      stopCamera()
+    }
   }, [])
 
   const departments = useMemo(() => {
@@ -100,21 +112,161 @@ export default function FaceRegistrationPage() {
     }
   }, [departments, years, department, year])
 
-  function handleCapture() {
-    setStage('detected')
-    setTimeout(() => setStage('captured'), 900)
+  function stopCamera() {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => track.stop())
+      streamRef.current = null
+    }
+
+    if (videoRef.current) {
+      videoRef.current.srcObject = null
+    }
   }
 
-  function handleRegister() {
-    setStage('registered')
+  async function startCamera() {
+    try {
+      setMessage('Starting camera...')
+      setCapturedBlob(null)
+      setCapturedImage(null)
+      setStage('camera')
+
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        setMessage('Camera is not supported in this browser.')
+        setStage('idle')
+        return
+      }
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          facingMode: 'user',
+        },
+        audio: false,
+      })
+
+      streamRef.current = stream
+
+      setTimeout(async () => {
+        if (!videoRef.current) {
+          setMessage('Video element not ready. Refresh and try again.')
+          setStage('idle')
+          return
+        }
+
+        videoRef.current.srcObject = stream
+        videoRef.current.muted = true
+        videoRef.current.playsInline = true
+
+        await videoRef.current.play()
+
+        setMessage('Camera active. Position your face and capture.')
+      }, 150)
+    } catch (error) {
+      console.error(error)
+      setStage('idle')
+      setMessage('Camera failed. Allow camera permission and try again.')
+    }
+  }
+
+  function handleCapture() {
+    if (!videoRef.current || !canvasRef.current) {
+      setMessage('Camera is not ready.')
+      return
+    }
+
+    const video = videoRef.current
+    const canvas = canvasRef.current
+
+    const width = video.videoWidth || 640
+    const height = video.videoHeight || 480
+
+    if (!width || !height) {
+      setMessage('Camera is still loading. Wait 2 seconds and try again.')
+      return
+    }
+
+    canvas.width = width
+    canvas.height = height
+
+    const context = canvas.getContext('2d')
+
+    if (!context) {
+      setMessage('Could not capture image.')
+      return
+    }
+
+    context.drawImage(video, 0, 0, width, height)
+
+    const imageData = canvas.toDataURL('image/jpeg', 0.95)
+
+    fetch(imageData)
+      .then((response) => response.blob())
+      .then((blob) => {
+        setCapturedBlob(blob)
+        setCapturedImage(imageData)
+        setStage('captured')
+        setMessage('Face captured. Click Register Face.')
+        stopCamera()
+      })
+      .catch(() => {
+        setMessage('Could not create image file.')
+      })
+  }
+
+  async function handleRegister() {
+    if (!studentId.trim() || !studentName.trim() || !department || !year) {
+      setMessage('Fill all student details first.')
+      return
+    }
+
+    if (!capturedBlob) {
+      setMessage('Capture face first.')
+      return
+    }
+
+    try {
+      setIsLoading(true)
+      setMessage('Registering face...')
+
+      const formData = new FormData()
+      formData.append('student_id', studentId.trim())
+      formData.append('name', studentName.trim())
+      formData.append('department', department)
+      formData.append('year', year)
+      formData.append('file', capturedBlob, `${studentId.trim()}_face.jpg`)
+
+      const response = await fetch('http://127.0.0.1:8000/register-face', {
+        method: 'POST',
+        body: formData,
+      })
+
+      const data = await response.json()
+
+      if (!response.ok || !data.registered) {
+        setMessage(`Registration failed: ${data.reason || 'unknown error'}`)
+        return
+      }
+
+      setStage('registered')
+      setMessage('Face registered successfully.')
+    } catch {
+      setMessage('Backend connection failed. Make sure FastAPI is running.')
+    } finally {
+      setIsLoading(false)
+    }
   }
 
   function handleReset() {
+    stopCamera()
     setStage('idle')
     setStudentId('STU-013')
     setStudentName('')
     setDepartment(departments[0] || '')
     setYear(years[0] || '')
+    setCapturedBlob(null)
+    setCapturedImage(null)
+    setMessage('')
   }
 
   const status = statusCopy[stage]
@@ -134,21 +286,36 @@ export default function FaceRegistrationPage() {
 
           <CardContent className="flex flex-col gap-4">
             <div className="relative aspect-video w-full overflow-hidden rounded-xl border border-border bg-secondary/40">
-              <div className="absolute inset-0 flex items-center justify-center">
-                {stage === 'registered' ? (
-                  <div className="flex flex-col items-center gap-3 text-primary">
-                    <CheckCircle2 className="size-16" />
-                    <p className="text-sm font-medium">Face enrolled</p>
-                  </div>
-                ) : (
-                  <ScanFace
-                    className={cn(
-                      'size-20 transition-colors',
-                      stage === 'idle' ? 'text-muted-foreground/40' : 'text-primary/70',
-                    )}
-                  />
-                )}
-              </div>
+              {stage === 'camera' && (
+                <video
+                  ref={videoRef}
+                  className="h-full w-full object-cover"
+                  muted
+                  playsInline
+                  autoPlay
+                />
+              )}
+
+              {stage !== 'camera' && capturedImage && (
+                <img
+                  src={capturedImage}
+                  alt="Captured face"
+                  className="h-full w-full object-cover"
+                />
+              )}
+
+              {stage !== 'camera' && !capturedImage && (
+                <div className="absolute inset-0 flex items-center justify-center">
+                  {stage === 'registered' ? (
+                    <div className="flex flex-col items-center gap-3 text-primary">
+                      <CheckCircle2 className="size-16" />
+                      <p className="text-sm font-medium">Face enrolled</p>
+                    </div>
+                  ) : (
+                    <ScanFace className="size-20 text-muted-foreground/40" />
+                  )}
+                </div>
+              )}
 
               <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
                 <div
@@ -164,13 +331,15 @@ export default function FaceRegistrationPage() {
                 </div>
               </div>
 
-              {(stage === 'detected' || stage === 'captured') && (
+              {stage === 'camera' && (
                 <span className="absolute left-3 top-3 inline-flex items-center gap-1.5 rounded-full bg-background/80 px-2.5 py-1 text-xs font-medium text-primary backdrop-blur">
                   <span className="size-1.5 animate-pulse rounded-full bg-primary" />
                   Live
                 </span>
               )}
             </div>
+
+            <canvas ref={canvasRef} className="hidden" />
 
             <div className="flex items-center gap-2 rounded-lg border border-border bg-muted/30 px-4 py-3">
               <span
@@ -182,27 +351,56 @@ export default function FaceRegistrationPage() {
               <p className={cn('text-sm font-medium', status.tone)}>{status.label}</p>
             </div>
 
-            <div className="flex flex-col gap-2 sm:flex-row">
-              <Button
-                variant="outline"
-                size="lg"
-                className="flex-1 gap-2"
-                onClick={handleCapture}
-                disabled={stage === 'registered'}
-              >
-                <Camera className="size-4" />
-                Capture Face
-              </Button>
+            {message && (
+              <div className="rounded-lg border border-border bg-background px-4 py-3 text-sm text-muted-foreground">
+                {message}
+              </div>
+            )}
 
-              <Button
-                size="lg"
-                className="flex-1 gap-2"
-                onClick={handleRegister}
-                disabled={stage !== 'captured'}
-              >
-                <UserPlus className="size-4" />
-                Register Face
-              </Button>
+            <div className="flex flex-col gap-2 sm:flex-row">
+              {stage === 'idle' && (
+                <Button size="lg" className="flex-1 gap-2" onClick={startCamera}>
+                  <Camera className="size-4" />
+                  Start Camera
+                </Button>
+              )}
+
+              {stage === 'camera' && (
+                <Button
+                  variant="outline"
+                  size="lg"
+                  className="flex-1 gap-2"
+                  onClick={handleCapture}
+                >
+                  <Camera className="size-4" />
+                  Capture Face
+                </Button>
+              )}
+
+              {stage === 'captured' && (
+                <>
+                  <Button
+                    size="lg"
+                    className="flex-1 gap-2"
+                    onClick={handleRegister}
+                    disabled={isLoading}
+                  >
+                    <UserPlus className="size-4" />
+                    {isLoading ? 'Registering...' : 'Register Face'}
+                  </Button>
+
+                  <Button
+                    variant="outline"
+                    size="lg"
+                    className="gap-2"
+                    onClick={startCamera}
+                    disabled={isLoading}
+                  >
+                    <RefreshCw className="size-4" />
+                    Retake
+                  </Button>
+                </>
+              )}
 
               {stage === 'registered' && (
                 <Button variant="ghost" size="lg" className="gap-2" onClick={handleReset}>
@@ -227,6 +425,7 @@ export default function FaceRegistrationPage() {
                 placeholder="STU-013"
                 value={studentId}
                 onChange={(event) => setStudentId(event.target.value)}
+                disabled={isLoading || stage === 'registered'}
               />
             </div>
 
@@ -237,6 +436,7 @@ export default function FaceRegistrationPage() {
                 placeholder="Student name"
                 value={studentName}
                 onChange={(event) => setStudentName(event.target.value)}
+                disabled={isLoading || stage === 'registered'}
               />
             </div>
 
@@ -246,6 +446,7 @@ export default function FaceRegistrationPage() {
                 id="sdept"
                 value={department}
                 onChange={(event) => setDepartment(event.target.value)}
+                disabled={isLoading || stage === 'registered'}
               >
                 {departments.map((item) => (
                   <option key={item} value={item}>
@@ -261,6 +462,7 @@ export default function FaceRegistrationPage() {
                 id="syear"
                 value={year}
                 onChange={(event) => setYear(event.target.value)}
+                disabled={isLoading || stage === 'registered'}
               >
                 {years.map((item) => (
                   <option key={item} value={item}>
@@ -279,7 +481,7 @@ export default function FaceRegistrationPage() {
               </div>
             ) : (
               <p className="mt-2 text-xs text-muted-foreground">
-                Capture the student&apos;s face, then register to link it to this profile.
+                Start the camera, capture the student&apos;s face, then register it.
               </p>
             )}
           </CardContent>
