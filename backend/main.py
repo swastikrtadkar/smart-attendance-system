@@ -1,12 +1,13 @@
 import os
 import pickle
+import re
 import tempfile
 from datetime import datetime
 
 import cv2
 import gspread
 import numpy as np
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from google.oauth2.service_account import Credentials
 from insightface.app import FaceAnalysis
@@ -39,13 +40,37 @@ SERVICE_ACCOUNT_PATH = os.path.join(
 face_app = FaceAnalysis(name="buffalo_l")
 face_app.prepare(ctx_id=0, det_size=(640, 640))
 
-with open(EMBEDDINGS_PATH, "rb") as file:
-    face_data = pickle.load(file)
 
-known_embeddings = np.array(face_data["embeddings"])
-known_student_ids = face_data["student_ids"]
-known_names = face_data["names"]
-known_folders = face_data["folders"]
+def load_face_data():
+    global face_data
+    global known_embeddings
+    global known_student_ids
+    global known_names
+    global known_folders
+
+    with open(EMBEDDINGS_PATH, "rb") as file:
+        face_data = pickle.load(file)
+
+    face_data.setdefault("embeddings", [])
+    face_data.setdefault("student_ids", [])
+    face_data.setdefault("names", [])
+    face_data.setdefault("folders", [])
+    face_data.setdefault("model", "insightface_buffalo_l")
+
+    known_embeddings = np.array(face_data["embeddings"])
+    known_student_ids = face_data["student_ids"]
+    known_names = face_data["names"]
+    known_folders = face_data["folders"]
+
+
+def save_face_data():
+    with open(EMBEDDINGS_PATH, "wb") as file:
+        pickle.dump(face_data, file)
+
+    load_face_data()
+
+
+load_face_data()
 
 
 def get_google_sheet():
@@ -65,6 +90,12 @@ def get_google_sheet():
     return spreadsheet
 
 
+def make_face_folder_name(name: str):
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", name.strip())
+    cleaned = cleaned.strip("_")
+    return cleaned or "unknown_face"
+
+
 def get_student_department(student_id: str):
     spreadsheet = get_google_sheet()
     students_sheet = spreadsheet.worksheet("Students")
@@ -75,6 +106,60 @@ def get_student_department(student_id: str):
             return str(student.get("department", "")).strip()
 
     return ""
+
+
+def update_or_add_student(student_id: str, name: str, department: str, year: str):
+    spreadsheet = get_google_sheet()
+    students_sheet = spreadsheet.worksheet("Students")
+
+    rows = students_sheet.get_all_values()
+    today = datetime.now().strftime("%Y-%m-%d")
+    face_folder = make_face_folder_name(name)
+
+    # Expected columns:
+    # student_id, name, department, year, face_status,
+    # attendance_percentage, created_at, face_folder
+
+    for index, row in enumerate(rows[1:], start=2):
+        existing_student_id = row[0].strip() if len(row) > 0 else ""
+
+        if existing_student_id == student_id:
+            students_sheet.update(
+                f"A{index}:H{index}",
+                [[
+                    student_id,
+                    name,
+                    department,
+                    year,
+                    "registered",
+                    row[5] if len(row) > 5 and row[5] else "0",
+                    row[6] if len(row) > 6 and row[6] else today,
+                    face_folder,
+                ]],
+            )
+
+            return {
+                "action": "updated",
+                "face_folder": face_folder,
+            }
+
+    students_sheet.append_row(
+        [
+            student_id,
+            name,
+            department,
+            year,
+            "registered",
+            "0",
+            today,
+            face_folder,
+        ]
+    )
+
+    return {
+        "action": "added",
+        "face_folder": face_folder,
+    }
 
 
 def get_next_attendance_id():
@@ -98,6 +183,35 @@ def get_next_attendance_id():
                 continue
 
     return f"ATT-{last_number + 1:04d}"
+
+
+def get_single_face_embedding(image_path: str):
+    image_bgr = cv2.imread(image_path)
+
+    if image_bgr is None:
+        return {
+            "status": "image_not_read",
+            "embedding": None,
+        }
+
+    faces = face_app.get(image_bgr)
+
+    if len(faces) == 0:
+        return {
+            "status": "no_face_detected",
+            "embedding": None,
+        }
+
+    if len(faces) > 1:
+        return {
+            "status": "multiple_faces_detected",
+            "embedding": None,
+        }
+
+    return {
+        "status": "success",
+        "embedding": faces[0].normed_embedding,
+    }
 
 
 @app.get("/")
@@ -133,11 +247,11 @@ def test_sheet():
 
 
 def recognize_image(image_path: str, threshold: float = 0.45):
-    image_bgr = cv2.imread(image_path)
+    embedding_result = get_single_face_embedding(image_path)
 
-    if image_bgr is None:
+    if embedding_result["status"] != "success":
         return {
-            "status": "image_not_read",
+            "status": embedding_result["status"],
             "student_id": None,
             "name": None,
             "folder": None,
@@ -145,11 +259,9 @@ def recognize_image(image_path: str, threshold: float = 0.45):
             "distance": None,
         }
 
-    faces = face_app.get(image_bgr)
-
-    if len(faces) == 0:
+    if len(known_embeddings) == 0:
         return {
-            "status": "no_face_detected",
+            "status": "no_registered_faces",
             "student_id": None,
             "name": None,
             "folder": None,
@@ -157,17 +269,7 @@ def recognize_image(image_path: str, threshold: float = 0.45):
             "distance": None,
         }
 
-    if len(faces) > 1:
-        return {
-            "status": "multiple_faces_detected",
-            "student_id": None,
-            "name": None,
-            "folder": None,
-            "similarity": None,
-            "distance": None,
-        }
-
-    test_embedding = faces[0].normed_embedding
+    test_embedding = embedding_result["embedding"]
 
     similarities = np.dot(known_embeddings, test_embedding)
 
@@ -206,6 +308,63 @@ async def recognize(file: UploadFile = File(...)):
     try:
         result = recognize_image(temp_path)
         return result
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+@app.post("/register-face")
+async def register_face(
+    student_id: str = Form(...),
+    name: str = Form(...),
+    department: str = Form(...),
+    year: str = Form(...),
+    file: UploadFile = File(...),
+):
+    suffix = os.path.splitext(file.filename or "")[-1]
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+        temp_file.write(await file.read())
+        temp_path = temp_file.name
+
+    try:
+        embedding_result = get_single_face_embedding(temp_path)
+
+        if embedding_result["status"] != "success":
+            return {
+                "registered": False,
+                "reason": embedding_result["status"],
+            }
+
+        face_folder = make_face_folder_name(name)
+        embedding = embedding_result["embedding"]
+
+        face_data["embeddings"].append(embedding)
+        face_data["student_ids"].append(student_id.strip())
+        face_data["names"].append(name.strip())
+        face_data["folders"].append(face_folder)
+
+        save_face_data()
+
+        sheet_result = update_or_add_student(
+            student_id=student_id.strip(),
+            name=name.strip(),
+            department=department.strip(),
+            year=year.strip(),
+        )
+
+        return {
+            "registered": True,
+            "message": "Face registered successfully",
+            "student_id": student_id.strip(),
+            "name": name.strip(),
+            "department": department.strip(),
+            "year": year.strip(),
+            "face_folder": face_folder,
+            "sheet_action": sheet_result["action"],
+            "registered_embeddings": len(known_embeddings),
+        }
+
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
